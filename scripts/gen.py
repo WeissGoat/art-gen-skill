@@ -18,14 +18,17 @@ import json
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _gateway import ensure_importable, find_config, find_gateway, git_commit  # noqa: E402
 
 
 _TRANSIENT = re.compile(r"429|too many|rate limit|504|timeout|timed out|502|503", re.IGNORECASE)
+# Cloudflare gave up waiting but the relay may still finish the image; look it up instead of paying for it again.
+_GATEWAY_TIMEOUT = re.compile(r"HTTP 524\b")
 
 
 def _sha(data: bytes) -> str:
@@ -54,6 +57,56 @@ def _decode(data: bytes) -> tuple[int, int, str] | None:
             return img.width, img.height, (img.format or "").lower()
     except Exception:
         return None
+
+
+def _relay(config: Path, provider: str | None) -> tuple[str, str] | None:
+    """base_url and key of an OpenAI-style relay provider, for its GET /results lookup."""
+    import yaml
+
+    data = yaml.safe_load(config.read_text(encoding="utf-8")) or {}
+    name = provider or (data.get("defaults") or {}).get("provider") or data.get("default_provider")
+    conf = (data.get("providers") or {}).get(name) or {}
+    base, key = (conf.get("settings") or {}).get("base_url"), (conf.get("auth") or {}).get("api_key")
+    return (base.rstrip("/"), key) if base and key else None
+
+
+def _relay_get(url: str, key: str | None = None) -> bytes:
+    import urllib.request
+
+    headers = {"User-Agent": "Mozilla/5.0"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=120) as resp:
+        return resp.read()
+
+
+async def _recover(relay: tuple[str, str], prompt: str, since: datetime, taken: set, minutes: float) -> tuple[bytes | None, str]:
+    """After a 524: wait for the relay's own record of this prompt (sent at or after since) and fetch its image.
+
+    Only non-streaming requests can be recovered; a dropped stream is cancelled on the relay."""
+    import urllib.error
+    import urllib.parse
+
+    base, key = relay
+    query = urllib.parse.urlencode({"since": since.isoformat(timespec="seconds"), "q": prompt[:80], "limit": 100})
+    deadline = time.monotonic() + minutes * 60
+    while True:
+        try:
+            body = json.loads(_relay_get(f"{base}/results?{query}", key))
+        except urllib.error.HTTPError as e:
+            return None, f"results lookup unavailable (HTTP {e.code})"
+        rows = body.get("data", body) if isinstance(body, dict) else body
+        rows = sorted((r for r in rows if r.get("id") not in taken), key=lambda r: r.get("created_at") or "")
+        row = rows[0] if rows else None
+        if row and row.get("status") == "success" and row.get("url"):
+            taken.add(row["id"])
+            return _relay_get(row["url"]), f"recovered {row['id']} from {row['url']}"
+        if row and row.get("status") in ("failed", "cancelled"):
+            taken.add(row["id"])
+            return None, f"relay result {row['status']}: {row.get('error') or ''}"
+        if time.monotonic() > deadline:
+            return None, f"relay result still {row.get('status') if row else 'missing'} after {minutes:.0f} min"
+        await asyncio.sleep(20)
 
 
 async def run(args: argparse.Namespace) -> int:
@@ -111,6 +164,8 @@ async def run(args: argparse.Namespace) -> int:
         "errors": [],
     }
 
+    relay = _relay(config, args.provider) if args.recover_min > 0 and not extra.get("stream") else None
+    taken: set = set()
     async with ImageService(config) as svc:
         for i in range(args.n):
             seed = args.seed + i if args.seed is not None else None
@@ -118,12 +173,23 @@ async def run(args: argparse.Namespace) -> int:
                           provider=args.provider, extra=extra)
             t0 = time.monotonic()
             for attempt in range(args.retries + 1):
+                sent_at = datetime.now().astimezone().replace(microsecond=0) - timedelta(seconds=30)
                 if args.mode == "generate":
                     result = await svc.generate(GenerateRequest(width=width or 1024, height=height or 1024, **common))
                 elif args.mode == "i2i":
                     result = await svc.image_to_image(ImageToImageRequest(images=ref_bytes, width=width, height=height, **common))
                 else:
                     result = await svc.inpaint(InpaintRequest(image=ref_bytes[0], mask=mask_bytes, width=width, height=height, **common))
+                if relay and not result.results and any(_GATEWAY_TIMEOUT.search(e) for e in result.errors):
+                    print(f"[{i + 1}/{args.n}] 524, looking the result up on the relay (up to {args.recover_min:.0f} min)")
+                    data, note = await _recover(relay, prompt, sent_at, taken, args.recover_min)
+                    evidence["errors"].append({"request": i + 1, "error": result.errors[-1][:200], "recovery": note})
+                    print(f"[{i + 1}/{args.n}] {note}")
+                    if data is not None:
+                        result.errors.clear()
+                        result.results.append(SimpleNamespace(
+                            image_bytes=data, seed=None, provider_name=args.provider or "relay", model_name="recovered"))
+                        break
                 transient = not result.results and any(_TRANSIENT.search(e) for e in result.errors)
                 if not transient or attempt == args.retries:
                     break
@@ -175,6 +241,8 @@ def main() -> int:
     parser.add_argument("--delay", type=float, default=2.0, help="请求间隔秒数")
     parser.add_argument("--retries", type=int, default=2, help="限流 / 超时类错误的重试次数")
     parser.add_argument("--retry-wait", type=float, default=30.0, help="重试前等待秒数")
+    parser.add_argument("--recover-min", type=float, default=10.0,
+                        help="遇到 524 时到中转站 GET /results 按 prompt 和时间找回结果，最多等几分钟；0 关闭。流式请求找不回")
     parser.add_argument("--extra", help="原样传给 provider 的 JSON，例如 '{\"model\": \"nai-diffusion-5\"}'")
     parser.add_argument("--out", required=True, help="输出目录")
     parser.add_argument("--prefix", help="文件名前缀，默认 rHHMMSS")

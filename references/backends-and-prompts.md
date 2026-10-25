@@ -22,6 +22,7 @@
 
 - `openai_images`（gpt-image-2 经中转）：单张约 40–200 秒；常见 429 / "Too many requests" / 504 超时。观察到不管请求什么尺寸都返回 1024²，需要别的画幅就后处理裁切，或改用别的后端。
 - `gemini_chat_image`：文生图约 60 秒；图生图约 1–2 分钟。返回尺寸只是接近请求的画幅（网关把宽高映射成 aspectRatio + imageSize），不保证精确像素，正式资产要后处理到规格尺寸。用一张母版做转面 / 差分时，服装细节保持得很好。中转报 captcha / RPC 错误属于中转配置问题，报告给用户，不要自己去配验证码。
+- 中转（Cloudflare 后面的 OpenAI 兼容中转）报 HTTP 524：Cloudflare 等了 100 秒就断开，服务端多半还在出图。不要立刻重发（重发会再花一次额度）。`gen.py` 遇到 524 会自动到中转的 `GET <base_url>/results?since=<发送时间>&q=<prompt 开头>` 找回结果（`--recover-min` 控制最多等几分钟，0 关闭）；中转没有这个接口时照常报错。参考图多（每张串行上传）的 Gemini 图生图也可以加 `--extra '{"stream": true}'` 走流式，进度包会保活连接；流式请求断开后服务端会取消，找不回。
 - `novelai`：快（832×1216 约 8 秒）。网关默认关掉 Quality Tags、UC preset 为 None，所以质量词和 UC 自己写。V5：`--extra '{"model": "nai-diffusion-5-full", "qualityPresetId": "none", "ucPresetId": "none"}'`，V5 强制 karras 调度。inpaint 的 mask 白色表示重绘区域。偶尔 429。
 - `grok_chat_image`：只作实验，先单独 smoke。
 
